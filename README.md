@@ -153,19 +153,41 @@ BIO and lose on LSK and APEX.
 
 `cexflows.sellcurve` replaces the slices with curves: for each holder group (underwater, in profit,
 zero-cost, unknown, and market makers), the net share of starting balance sold by the time the
-price has run to k times the start, averaged across rallies, each counted only at the multiples
-it reached. `backtest.rally_records` builds the per-wallet input; `python -m cexflows.sellcurve
+price has run to k times the start, the median across rallies (`--median`; the mean is the
+default), each counted only at the multiples it reached. `backtest.rally_records` builds the per-wallet input; `python -m cexflows.sellcurve
 records/*.json --save` fits the curves into `cexflows/sell_curves.json` and prints a
 leave-one-rally-out check. Query 5 then adds `curve_tokens` (holders) and `trader_tokens` (market
 makers) per step.
 
-Held out, realized over predicted at each rally's peak: DEXE 1.17, LSK 2.72, APEX 0.24, BIO 1.72,
-against 32, 2.1, 0.74 and 5.4 for the levels. Market makers: 1.7-1.9 where present. Four rallies
-are few, so the curves are a rough prior, and they are noisier at small lifts than at the peak.
-Making them required two fixes found during the check: shares are averaged per rally, since
-pooling token counts let the largest-supply token dominate, and a wallet holding 5% or more of
-supply at zero cost that has never sold is set aside as a treasury (APEX had two, 50% and 15.7%).
-The second only affected APEX and was added after seeing that miss.
+The shipped curves are fitted on 13 Ethereum rallies of 2-11x: DEXE, LSK, APEX and BIO, then
+MORPHO, ATH, BARD, FF, GWEI, EDGE, SENT, SPK and SAFE, mostly mid caps, with windows fixed by a
+CoinGecko screen before any results were seen. Held out one at a time, the miss in percentage
+points of the holders' starting balance (median across rallies, worst in brackets):
+
+| lift | holders, mean fit | holders, median fit | market makers, mean fit | market makers, median fit |
+| - | - | - | - | - |
+| 1.1x | 0.5 (4.9) | 0.1 (5.0) | 10.9 (39) | 2.1 (45) |
+| 1.25x | 1.2 (7.9) | 1.6 (8.4) | 23.7 (68) | 5.2 (79) |
+| 1.5x | 8.0 (34) | 2.4 (36) | 27.3 (61) | 19.2 (66) |
+| 2x | 8.5 (34) | 7.3 (36) | 20.9 (51) | 15.7 (50) |
+| peak | 9.5 (35) | 4.9 (34) | 22.0 (91) | 15.4 (88) |
+
+Points of balance, not the ratio, is the measure: at small lifts both sides are a few percent and
+the ratio explodes on tiny numbers. The median wins because market makers are two populations,
+not one noisy one. In 7 of 12 rallies they sold 0-5% by 1.25x; in the other 5 (FF, GWEI, LSK,
+SENT, SPK) they sold 19-84%. A mean lands between the two and is wrong for every rally. The
+median is right for the typical one and under-states the average: at 1.25x it predicts 5% where
+the average rally saw 22%. Nothing visible at the trough (market-maker count, share of supply,
+prior trading) separated the two, so the market-maker layer should be read as "typical, with a
+real chance of a dump". Holders are steadier; the misses that remain are a few rallies where
+they sold heavily early (DEXE and LSK by 1.5x).
+
+Making the curves required two fixes found during the check: shares are combined per rally,
+since pooling token counts let the largest-supply token dominate, and a wallet holding 5% or more
+of supply at zero cost that has never sold is set aside as a treasury (APEX had two, 50% and
+15.7%). The second only affected APEX and was added after seeing that miss. One BARD block held
+an airdrop of more than a page of transfers, so `etherscan.transfers` pages through a block that
+size instead of refusing it.
 
 ## Configuration
 

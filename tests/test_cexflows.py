@@ -138,18 +138,22 @@ def test_server_rejects_foreign_host():
         httpd.shutdown()
 
 
-def test_inbound_transfers_refuses_a_block_with_more_than_a_page(monkeypatch):
-    def log(idx):
-        return {"blockNumber": hex(5), "timeStamp": hex(T0), "transactionHash": f"0x{idx:064x}",
+def test_transfers_page_through_a_block_with_more_than_a_page(monkeypatch):
+    def log(block, idx):
+        return {"blockNumber": hex(block), "timeStamp": hex(T0), "transactionHash": f"0x{idx:064x}",
                 "logIndex": hex(idx), "topics": ["0x", "0x" + "0" * 24 + "1" * 40, "0x"], "data": hex(1)}
 
+    airdrop = [log(5, i) for i in range(5)]                 # five transfers in one block, pages of 2
+
+    def call(chain, **p):
+        if p["fromBlock"] == p["toBlock"] == 5:
+            return airdrop[(p["page"] - 1) * 2:p["page"] * 2]
+        return {5: airdrop[:2], 6: [log(7, 9)]}.get(p["fromBlock"], [])
+
     monkeypatch.setattr(etherscan, "PAGE", 2)
-    monkeypatch.setattr(etherscan, "call", lambda chain, **p: [log(0), log(1)])
-    try:
-        list(etherscan.inbound_transfers("arbitrum", "0xt", "0x" + "a" * 40, 5, 10))
-        assert False, "should refuse rather than loop"
-    except etherscan.EtherscanError as e:
-        assert "block 5" in str(e)
+    monkeypatch.setattr(etherscan, "call", call)
+    got = list(etherscan.transfers("ethereum", "0xt", 5, 10))
+    assert [(t["block"], t["log_index"]) for t in got] == [(5, i) for i in range(5)] + [(7, 9)]
 
 
 def test_vesting_pairs_recur_on_cliffs_and_never_in_controls():
@@ -417,3 +421,13 @@ def test_supply_curve_adds_curve_layers_split_by_market_makers():
     assert abs(rows[0]["curve_tokens"] - 10) < 1e-9 and abs(rows[0]["trader_tokens"] - 5) < 1e-9   # 1.0 -> 1.1
     assert abs(sum(r["curve_tokens"] for r in rows) - 40) < 1e-6                 # flat past the grid
     assert supply_curve(hs, 1.0, max_multiple=2.0, step_pct=10)[0]["curve_tokens"] is None
+
+
+def test_fit_median_is_not_dragged_by_one_rally():
+    from cexflows import sellcurve
+    def rally(sold):
+        hs = [{"group": "trader", "balance": 100.0, "events": [[1.1, sold]]} for _ in range(3)]
+        return {"max_multiple": 2.0, "holders": hs}
+    rs = [rally(0.0), rally(2.0), rally(90.0)]
+    assert abs(sellcurve.fit(rs, [1.1])["trader"][0] - 0.92 / 3) < 1e-9
+    assert sellcurve.fit(rs, [1.1], stat="median")["trader"][0] == 0.02

@@ -13,7 +13,8 @@ clamped to [0, starting balance] per holder and never decreasing in k. Groups ar
 rally's start: underwater (cost above the start price), in_profit, zero_cost (mostly vested or
 airdropped), unknown (no priced lots), and trader (market-maker-like). A rally only informs the
 multiples it reached. Within a rally a group's share is pooled by tokens, so large holders weigh
-most; across rallies each rally counts once, since token units of different tokens don't compare.
+most; across rallies each rally counts once, since token units of different tokens don't compare,
+and the shipped curves take the median (market makers either sit or dump; a mean fits neither).
 A group with fewer than MIN_HOLDERS holders in a rally at some k leaves that rally out of it; with
 no rally left it uses all groups.
 
@@ -80,8 +81,9 @@ def sold_by(events: List[list], balance: float, k: float) -> float:
     return best
 
 
-def fit(rallies: List[dict], grid: List[float] = GRID) -> Dict[str, List[Optional[float]]]:
-    """Group -> share sold at each grid multiple (None where no rally reached it)."""
+def fit(rallies: List[dict], grid: List[float] = GRID, stat: str = "mean") -> Dict[str, List[Optional[float]]]:
+    """Group -> share sold at each grid multiple (None where no rally reached it). `stat` combines
+    the rallies: "mean", or "median", which one outlier rally can't drag."""
     curves: Dict[str, List[Optional[float]]] = {}
     for g in GROUPS + ["all"]:
         row: List[Optional[float]] = []
@@ -93,7 +95,7 @@ def fit(rallies: List[dict], grid: List[float] = GRID) -> Dict[str, List[Optiona
                     continue
                 bal = sum(h["balance"] for h in hs)
                 shares.append(sum(sold_by(h["events"], h["balance"], k) for h in hs) / bal)
-            row.append(sum(shares) / len(shares) if shares else None)
+            row.append(_combine(shares, stat) if shares else None)
         curves[g] = row
     for g in GROUPS:                       # thin groups borrow the pooled curve
         curves[g] = [v if v is not None else a for v, a in zip(curves[g], curves["all"])]
@@ -103,6 +105,14 @@ def fit(rallies: List[dict], grid: List[float] = GRID) -> Dict[str, List[Optiona
             last = max(last, v) if v is not None else last
             row[i] = last
     return curves
+
+
+def _combine(xs: List[float], stat: str) -> float:
+    if stat == "median":
+        xs = sorted(xs)
+        n = len(xs)
+        return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
+    return sum(xs) / len(xs)
 
 
 def share_at(curve: List[float], k: float, grid: List[float] = GRID) -> float:
@@ -125,36 +135,60 @@ def predict(holders: List[dict], curves: Dict[str, List[float]], k: float) -> Di
     return out
 
 
-def leave_one_out(rallies: List[dict], ks=(1.5, 2.0, 3.0, 5.0)) -> List[dict]:
+def leave_one_out(rallies: List[dict], ks=(1.1, 1.25, 1.5, 2.0, 3.0, 5.0), stat: str = "mean") -> List[dict]:
     """For each rally, fit on the others and compare predicted with realized net selling by its
     top holders at a few multiples and at its own peak."""
     rows = []
     for i, r in enumerate(rallies):
-        curves = fit(rallies[:i] + rallies[i + 1:])
+        curves = fit(rallies[:i] + rallies[i + 1:], stat=stat)
         for k in [k for k in ks if k <= r["max_multiple"]] + [r["max_multiple"]]:
             for layer, keep in (("holders", lambda g: g != "trader"), ("traders", lambda g: g == "trader")):
                 hs = [h for h in r["holders"] if keep(h["group"])]
                 pred = sum(predict(hs, curves, k).values())
                 real = sum(sold_by(h["events"], h["balance"], k) for h in hs)
-                rows.append({"token": r["token"], "k": round(k, 2), "layer": layer,
+                rows.append({"token": r["token"], "name": r.get("name"), "k": round(k, 2),
+                             "at_peak": k == r["max_multiple"], "layer": layer,
                              "balance": sum(h["balance"] for h in hs), "predicted": pred, "realized": real,
                              "realized_over_predicted": real / pred if pred else None})
     return rows
 
 
+def summarize(rows: List[dict]) -> List[dict]:
+    """Per lift and layer: median |log(realized / predicted)| and the share of rallies within 2x.
+    Rows with nothing realized and nothing predicted are skipped; one side zero counts as a miss."""
+    out = []
+    for layer in ("holders", "traders"):
+        for label, pick in [(f"{k:g}x", lambda r, k=k: r["k"] == k and not r["at_peak"]) for k in (1.1, 1.25, 1.5, 2.0)] + [
+                ("peak", lambda r: r["at_peak"])]:
+            rs = [r for r in rows if r["layer"] == layer and pick(r) and (r["predicted"] > 0 or r["realized"] > 0)]
+            if not rs:
+                continue
+            errs = [abs(math.log(r["realized"] / r["predicted"])) if r["predicted"] > 0 and r["realized"] > 0 else math.inf
+                    for r in rs]
+            errs.sort()
+            # At small lifts realized selling is a few percent of balance, so the factor explodes on
+            # tiny numbers; the miss in percentage points of balance is what moves a dollar cost.
+            pts = sorted(abs(r["realized"] - r["predicted"]) / r["balance"] for r in rs if r["balance"])
+            out.append({"layer": layer, "lift": label, "rallies": len(rs), "median_factor": math.exp(errs[len(errs) // 2]),
+                        "within_2x": sum(e <= math.log(2) for e in errs) / len(errs),
+                        "median_points": pts[len(pts) // 2] if pts else None, "max_points": pts[-1] if pts else None})
+    return out
+
+
 def main(argv: Optional[List[str]] = None) -> None:
     args = list(argv if argv is not None else sys.argv[1:])
     save = "--save" in args
-    paths = [a for a in args if a != "--save"]
+    stat = "median" if "--median" in args else "mean"
+    paths = [a for a in args if not a.startswith("--")]
     rallies = [json.load(open(p, encoding="utf-8")) for p in paths]
-    curves = fit(rallies)
-    loo = leave_one_out(rallies)
+    curves = fit(rallies, stat=stat)
+    loo = leave_one_out(rallies, stat=stat)
     names = {r["token"]: r.get("name") or r["token"] for r in rallies}
     if save:
         peaks = [r for r in loo if r["layer"] == "holders" and r["k"] == round(
             next(x["max_multiple"] for x in rallies if x["token"] == r["token"]), 2)]
         with open(CURVES_PATH, "w", encoding="utf-8") as f:
-            json.dump({"grid": GRID, "curves": curves,
+            json.dump({"grid": GRID, "stat": stat, "curves": curves,
                        "rallies": [{"name": r.get("name") or r["token"], "start": r["start"], "peak": r["peak"],
                                     "max_multiple": round(r["max_multiple"], 2)} for r in rallies],
                        "leave_one_out_at_peak": {names[r["token"]]: round(r["realized_over_predicted"], 2) for r in peaks
@@ -164,7 +198,12 @@ def main(argv: Optional[List[str]] = None) -> None:
     print("  " + "".join(f"{k:>7g}x" for k in GRID))
     for g in GROUPS + ["all"]:
         print(f"  {g:<11}" + "".join(f"{v:>8.0%}" for v in curves[g]))
-    print("\nleave one rally out:")
+    print("\nleave one rally out, summary (median error as a factor, share of rallies within 2x):")
+    for x in summarize(loo):
+        print(f"  {x['layer']:<8} {x['lift']:<6} {x['rallies']:>3} rallies  median off by {x['median_factor']:.2f}x  "
+              f"within 2x: {x['within_2x']:.0%}  off by {x['median_points']:.1%} of balance (worst {x['max_points']:.1%})")
+    if "--detail" not in args:
+        return
     for row in loo:
         r = row["realized_over_predicted"]
         print(f"  {row['token'][:10]} k={row['k']:<6} {row['layer']:<8} predicted {row['predicted']:>14,.0f}  "

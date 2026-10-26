@@ -130,6 +130,18 @@ def inbound_transfers(chain: str, token: str, wallet: str, from_block: int, to_b
     return transfers(chain, token, from_block, to_block, recipient=wallet)
 
 
+def _transfer(lg: dict) -> dict:
+    return {
+        "block": int(lg["blockNumber"], 16),
+        "ts": int(lg["timeStamp"], 16),
+        "tx": lg["transactionHash"],
+        "log_index": int(lg["logIndex"], 16) if lg["logIndex"] != "0x" else 0,
+        "from": "0x" + lg["topics"][1][-40:],
+        "to": "0x" + lg["topics"][2][-40:],
+        "value": int(lg["data"], 16) if lg["data"] not in ("0x", "") else 0,
+    }
+
+
 def transfers(chain: str, token: str, from_block: int, to_block: int,
               sender: Optional[str] = None, recipient: Optional[str] = None) -> Iterator[dict]:
     """Transfers of `token` in [from_block, to_block], oldest first, optionally only those from
@@ -154,25 +166,30 @@ def transfers(chain: str, token: str, from_block: int, to_block: int,
         last_block = int(logs[-1]["blockNumber"], 16)
         page_last_block = set()
         for lg in logs:
-            key = (lg["transactionHash"], int(lg["logIndex"], 16) if lg["logIndex"] != "0x" else 0)
-            if int(lg["blockNumber"], 16) == last_block:
+            t = _transfer(lg)
+            key = (t["tx"], t["log_index"])
+            if t["block"] == last_block:
                 page_last_block.add(key)
-            if key in seen:
-                continue
-            yield {
-                "block": int(lg["blockNumber"], 16),
-                "ts": int(lg["timeStamp"], 16),
-                "tx": lg["transactionHash"],
-                "log_index": key[1],
-                "from": "0x" + lg["topics"][1][-40:],
-                "to": "0x" + lg["topics"][2][-40:],
-                "value": int(lg["data"], 16) if lg["data"] not in ("0x", "") else 0,
-            }
+            if key not in seen:
+                yield t
         if len(logs) < PAGE:
             return
+        if last_block == start:
+            # One block holds more than a page (an airdrop): page through that block alone.
+            page = 2
+            while True:
+                more: List[dict] = call(chain, module="logs", action="getLogs", address=token, **filters,
+                                        fromBlock=start, toBlock=start, page=page, offset=PAGE) or []
+                for lg in more:
+                    t = _transfer(lg)
+                    if (t["tx"], t["log_index"]) not in seen:
+                        yield t
+                if len(more) < PAGE:
+                    break
+                page += 1
+            seen, start = set(), start + 1
+            continue
         # A full page may stop mid-block, so the next call re-reads the last block and `seen`
         # (that block's keys only) drops the repeats.
-        if last_block == start:
-            raise EtherscanError(f"more than {PAGE} matching transfers in block {start}")
         seen = page_last_block
         start = last_block
