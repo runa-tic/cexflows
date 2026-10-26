@@ -26,6 +26,7 @@ from typing import Callable, Dict, List, Optional
 
 from . import holders
 from .cache import Cache
+from .sellcurve import position_group
 
 BANDS = [1.25, 1.5, 2.0, 3.0, 5.0, math.inf]
 
@@ -150,6 +151,48 @@ def backtest(chain: str, token: str, start: str, peak: str, after_days: int = 14
     out["priors"] = pred["priors"]
     out["excluded_share"] = sum(e["share_of_supply"] for e in pred["excluded"])
     return out
+
+
+def rally_records(chain: str, token: str, start: str, peak: str, after_days: int = 14, top_n: int = 100,
+                  cache: Optional[Cache] = None, progress: Callable[[str], None] = lambda m: None) -> dict:
+    """Each top holder's net selling over a rally, keyed by how far the price had run.
+
+    Holders and their groups are fixed at the start (the trough), from data up to that day. Over
+    the rally and `after_days` after the peak, each of their sales (to an exchange, pool or
+    deposit address) adds and each purchase from an exchange or pool subtracts; every event is
+    tagged with the highest daily price so far as a multiple of the start price. Tokens are
+    whole units."""
+    cache = cache or Cache()
+    pred = holders.holder_positions(chain, token, top_n=top_n, as_of=start, cache=cache, progress=progress)
+    start_end = _ts(start) + 86400
+    window_end = _ts(peak) + 86400 * (after_days + 1)
+    view = holders.market_view(chain.lower(), token.lower(), window_end, cache, progress=progress)
+    scale, prices, day = view["scale"], view["prices"], view["day"]
+    p0 = pred["price_now"]
+    run_max, best = {}, p0
+    for d in sorted(prices):
+        if start < d and prices[d]:
+            best = max(best, prices[d])
+        run_max[d] = best
+    k_at = lambda ts: run_max.get(day(ts), p0) / p0
+    who = {h["address"]: h for h in pred["holders"]}
+    events: Dict[str, List[list]] = {a: [] for a in who}
+    for a in who:
+        for x in view["sales"].get(a, []):
+            if start_end <= x["ts"] < window_end:
+                events[a].append([x["ts"], k_at(x["ts"]), x["tokens"] / scale])
+    market = view["hot"] | view["pools"]
+    for t in view["transfers"]:
+        if start_end <= t["ts"] < window_end and t["to"] in who and t["from"] in market:
+            events[t["to"]].append([t["ts"], k_at(t["ts"]), -t["value"] / scale])
+    last_day = datetime.fromtimestamp(window_end - 1, timezone.utc).strftime("%Y-%m-%d")
+    return {"token": token, "chain": chain, "start": start, "peak": peak, "start_price": p0,
+            "max_multiple": max((m for d, m in run_max.items() if d <= last_day), default=p0) / p0,
+            "holders": [{"address": a, "kind": h["kind"], "group": position_group(h, p0), "balance": h["balance"],
+                         "cost_basis_usd": h["cost_basis_usd"], "n_sales_before": h["n_sales"],
+                         "share_of_supply": h["share_of_supply"], "zero_cost_share": h["zero_cost_share"],
+                         "events": sorted(([k, v] for _, k, v in sorted(events[a])), key=lambda e: e[0])}
+                        for a, h in who.items()]}
 
 
 def main(argv: Optional[List[str]] = None) -> None:

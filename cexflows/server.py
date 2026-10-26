@@ -92,7 +92,7 @@ def _holder_behaviour(params: dict) -> List[dict]:
 
 
 def _supply_curve(params: dict) -> List[dict]:
-    from . import holders
+    from . import holders, sellcurve
 
     token = str(params.get("token_address") or "").strip()
     chain = str(params.get("chain") or "").strip()
@@ -104,13 +104,15 @@ def _supply_curve(params: dict) -> List[dict]:
     rows = holders.supply_curve(res["holders"], res["price_now"],
                                 max_multiple=float(params.get("max_multiple") or 3),
                                 step_pct=float(params.get("step_pct") or 5),
-                                target_price=float(params.get("target_price") or 0) or None)
+                                target_price=float(params.get("target_price") or 0) or None,
+                                curves=sellcurve.load())
     # Zero-cost holders release on a schedule, not at a price: one constant column, not a level.
     return [{**r, "time_triggered_tokens": res["time_triggered_tokens"]} for r in rows]
 
 
 CURVE_COLUMNS = ["price_from", "price_to", "breakeven_tokens", "takeprofit_tokens", "step_tokens",
-                 "cumulative_tokens", "step_usd", "wallets", "time_triggered_tokens"]
+                 "cumulative_tokens", "step_usd", "wallets", "time_triggered_tokens", "curve_tokens",
+                 "trader_tokens"]
 
 HOLDER_COLUMNS = ["address", "kind", "balance", "share_of_supply", "cost_basis_usd", "zero_cost_share", "origins",
                   "oldest_lot", "n_sales", "sold_tokens", "median_sale_multiple", "last_sale",

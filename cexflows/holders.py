@@ -26,7 +26,7 @@ from collections import defaultdict, deque
 from datetime import datetime, timezone
 from typing import Callable, Deque, Dict, Iterable, List, Optional, Set, Tuple
 
-from . import etherscan
+from . import etherscan, sellcurve
 from .cache import Cache
 from .flows import token_decimals
 from .labels import hot_wallets
@@ -37,6 +37,9 @@ GECKOTERMINAL = {"ethereum": "eth", "arbitrum": "arbitrum"}
 SAFE_GET_OWNERS = "0xa0e67e2b"     # getOwners(): answers only on a Safe multisig
 SERVICE_COUNTERPARTIES = 2000      # more distinct counterparties than this: a service, not a holder
 TRADER_SALES = 100                 # this many sales or more: a market maker or bot, not a holder
+# A wallet holding this share of supply or more, all at zero cost and never sold, is a treasury
+# the project-wallet rule missed (APEX: one wallet with 50% of supply, another 15.7%).
+TREASURY_SHARE = 0.05
 HISTORY_CHUNK = 250_000            # blocks per cached chunk of a token's history
 
 
@@ -271,11 +274,16 @@ def sell_levels(kind: str, balance: float, cost: Optional[float], own_sales: Lis
 
 
 def supply_curve(holders: List[dict], price_now: float, max_multiple: float = 3.0,
-                 step_pct: float = 5.0, target_price: Optional[float] = None) -> List[dict]:
+                 step_pct: float = 5.0, target_price: Optional[float] = None,
+                 curves: Optional[dict] = None) -> List[dict]:
     """Tokens price-triggered holders would sell, by price step from today's price up to
     `max_multiple` times it: each step's own tokens and the running total, split by level.
     `target_price` adds a step edge at exactly that price, so a buyback priced to it stops there
-    instead of at the top of the step it falls in."""
+    instead of at the top of the step it falls in. With `curves` (sellcurve.load()), each step
+    also has `curve_tokens` and `trader_tokens`: the net selling the fitted sell-through curves
+    expect from the holders and the market makers as the price runs through it. The backtest
+    found the levels under-predict rally selling 2-32x; the curves came within 1.2-2.7x on three
+    of four held-out rallies and over-predicted the fourth 4x."""
     edges = [price_now]
     while edges[-1] < price_now * max_multiple:
         edges.append(edges[-1] * (1 + step_pct / 100))
@@ -289,9 +297,12 @@ def supply_curve(holders: List[dict], price_now: float, max_multiple: float = 3.
         tp = [(h["takeprofit_tokens"], h) for h in holders if inside(h["takeprofit_price"])]
         step = sum(t for t, _ in be) + sum(t for t, _ in tp)
         cum += step
+        layers = sellcurve.step_tokens(holders, curves, price_now, lo, hi) if curves else None
         rows.append({"price_from": lo, "price_to": hi, "breakeven_tokens": sum(t for t, _ in be),
                      "takeprofit_tokens": sum(t for t, _ in tp), "step_tokens": step, "cumulative_tokens": cum,
-                     "step_usd": step * (lo + hi) / 2, "wallets": len({h["address"] for _, h in be + tp})})
+                     "step_usd": step * (lo + hi) / 2, "wallets": len({h["address"] for _, h in be + tp}),
+                     "curve_tokens": layers["holders"] if layers else None,
+                     "trader_tokens": layers["traders"] if layers else None})
     return rows
 
 
@@ -397,6 +408,9 @@ def holder_positions(chain: str, token: str, top_n: int = 100, as_of: Optional[s
             why = "deposit address"
         elif w in project:
             why = "project"
+        elif (bal / supply >= TREASURY_SHARE and not sales.get(w)
+              and sum(l[0] for l in book.lots[w] if l[1] == 0) >= 0.5 * bal):
+            why = "treasury"
         elif contract(w) and not is_safe(chain, w):
             why = "contract"
         if why:

@@ -43,7 +43,7 @@ The server runs no SQL. Each supported query is implemented natively under a loc
 
 | 4 | `holder_behaviour` | `token_address`, `chain`, `top_n` (100), `as_of` (date, for backtests) | one row per modelled holder: `address`, `kind` (`price`, `time`, `trader`, `unknown`), `balance`, `share_of_supply`, `cost_basis_usd`, `zero_cost_share`, `origins` (JSON), `oldest_lot`, `n_sales`, `sold_tokens`, `median_sale_multiple`, `last_sale` |
 
-| 5 | `supply_curve` | as query 4, plus `max_multiple` (3), `step_pct` (5) and optional `target_price` (adds a step edge there) | one row per price step from today's price: `price_from`, `price_to`, `breakeven_tokens`, `takeprofit_tokens`, `step_tokens`, `cumulative_tokens`, `step_usd`, `wallets`, `time_triggered_tokens` |
+| 5 | `supply_curve` | as query 4, plus `max_multiple` (3), `step_pct` (5) and optional `target_price` (adds a step edge there) | one row per price step from today's price: `price_from`, `price_to`, `breakeven_tokens`, `takeprofit_tokens`, `step_tokens`, `cumulative_tokens`, `step_usd`, `wallets`, `time_triggered_tokens`, `curve_tokens`, `trader_tokens` |
 
 `usd_to_cex` is each day's token amount at CoinGecko's daily price for that date, null where
 CoinGecko has no price.
@@ -148,6 +148,24 @@ The levels under-predict selling on three of four, because each holder gets at m
 Recall of sellers is high (88-96%) but precision only matches the base rate, since a 5-11x move
 crosses nearly every level. Per-wallet sale prices beat the constant baseline on DEXE, tie on
 BIO and lose on LSK and APEX.
+
+### Sell-through curves
+
+`cexflows.sellcurve` replaces the slices with curves: for each holder group (underwater, in profit,
+zero-cost, unknown, and market makers), the net share of starting balance sold by the time the
+price has run to k times the start, averaged across rallies, each counted only at the multiples
+it reached. `backtest.rally_records` builds the per-wallet input; `python -m cexflows.sellcurve
+records/*.json --save` fits the curves into `cexflows/sell_curves.json` and prints a
+leave-one-rally-out check. Query 5 then adds `curve_tokens` (holders) and `trader_tokens` (market
+makers) per step.
+
+Held out, realized over predicted at each rally's peak: DEXE 1.17, LSK 2.72, APEX 0.24, BIO 1.72,
+against 32, 2.1, 0.74 and 5.4 for the levels. Market makers: 1.7-1.9 where present. Four rallies
+are few, so the curves are a rough prior, and they are noisier at small lifts than at the peak.
+Making them required two fixes found during the check: shares are averaged per rally, since
+pooling token counts let the largest-supply token dominate, and a wallet holding 5% or more of
+supply at zero cost that has never sold is set aside as a treasury (APEX had two, 50% and 15.7%).
+The second only affected APEX and was added after seeing that miss.
 
 ## Configuration
 

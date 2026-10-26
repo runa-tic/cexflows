@@ -377,3 +377,43 @@ def test_backtest_score_compares_levels_with_realized_sales():
     bands = {c["band"]: c for c in r["curve"]}
     assert bands["1.25-1.5x"]["realized_tokens"] == 12 and bands["0-1.25x"]["predicted_tokens"] == 10
     assert bands["2-3x"]["realized_tokens"] == 38 and "3-5x" not in bands
+
+
+def test_sell_through_is_net_clamped_and_never_decreasing():
+    from cexflows.sellcurve import sold_by
+
+    events = [[1.2, 40], [1.5, -30], [2.0, 200]]          # sell 40, buy 30 back, then dump
+    assert sold_by(events, 100, 1.3) == 40
+    assert sold_by(events, 100, 1.6) == 40                 # buying back doesn't un-sell
+    assert sold_by(events, 100, 2.0) == 100                # capped at the starting balance
+
+
+def test_curves_use_only_rallies_that_reached_each_multiple():
+    from cexflows.sellcurve import GRID, fit, predict, share_at
+
+    def rally(top, sold_at_2x):
+        hs = [{"group": "in_profit", "balance": 100, "events": [[2.0, sold_at_2x]]} for _ in range(3)]
+        return {"token": "t", "max_multiple": top, "holders": hs}
+
+    curves = fit([rally(3.0, 50), rally(1.6, 0)])
+    i15, i2 = GRID.index(1.5), GRID.index(2.0)
+    assert curves["in_profit"][i15] == 0 and curves["in_profit"][i2] == 0.5     # 2x only from the first rally
+    assert curves["underwater"][i2] == curves["all"][i2]                          # empty group borrows the pool
+    assert share_at(curves["in_profit"], 1.0) == 0 and share_at(curves["in_profit"], 50) == curves["in_profit"][-1]
+    assert abs(predict([{"group": "in_profit", "balance": 10}], curves, 2.0)["in_profit"] - 5) < 1e-9
+
+
+def test_supply_curve_adds_curve_layers_split_by_market_makers():
+    from cexflows.holders import supply_curve
+
+    fitted = {"grid": [1.1, 1.25, 1.5, 2.0], "curves": {
+        "underwater": [0.1, 0.2, 0.3, 0.4], "in_profit": [0, 0, 0, 0], "zero_cost": [0, 0, 0, 0.1],
+        "unknown": [0, 0, 0, 0], "trader": [0.5, 0.5, 0.5, 0.5], "all": [0, 0, 0, 0]}}
+    hs = [{"address": "u", "kind": "price", "balance": 100, "cost_basis_usd": 3.0, "breakeven_price": None,
+           "breakeven_tokens": 0, "takeprofit_price": None, "takeprofit_tokens": 0},
+          {"address": "m", "kind": "trader", "balance": 10, "cost_basis_usd": 1.0, "breakeven_price": None,
+           "breakeven_tokens": 0, "takeprofit_price": None, "takeprofit_tokens": 0}]
+    rows = supply_curve(hs, 1.0, max_multiple=2.0, step_pct=10, curves=fitted)
+    assert abs(rows[0]["curve_tokens"] - 10) < 1e-9 and abs(rows[0]["trader_tokens"] - 5) < 1e-9   # 1.0 -> 1.1
+    assert abs(sum(r["curve_tokens"] for r in rows) - 40) < 1e-6                 # flat past the grid
+    assert supply_curve(hs, 1.0, max_multiple=2.0, step_pct=10)[0]["curve_tokens"] is None
