@@ -1,4 +1,22 @@
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+.venv/
+venv/
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+
+# Local state: the SQLite cache, keys and .env files stay out of the tree
 .env
 *.sqlite
+*.sqlite-journal
+*.sqlite-wal

@@ -16,6 +16,20 @@ export DUNE_API_BASE=http://127.0.0.1:8766/api/v1
 export DUNE_API_KEY=$(cat ~/.cexflows-key)
 ```
 
+The queries also run from the shell, without a server or a Dune client:
+
+```
+cexflows-holders --token 0x... --top-n 100        # positions, sell levels, supply curve
+cexflows-flows   --token 0x... --days 90          # daily inflow, with the top exchanges
+cexflows-cohorts --chain arbitrum --token 0x... --cliffs 2026-04-15,2026-05-16
+cexflows-cliff   --chain ethereum --token 0x... --cliffs 2026-01-15,2026-02-15,2026-03-15 --release 1.5e8
+cexflows-backtest --token 0x... --start 2026-02-21 --peak 2026-04-20
+```
+
+`cexflows-holders` and `cexflows-flows` take `--json PATH` for the whole result and `--csv PATH`
+for the table (`-` is stdout). The server and every command are one entry point each, so
+`pip install .` is enough; the same modules also run as `python -m cexflows.holders` and so on.
+
 Stdlib only, Python 3.8+.
 
 ## What it measures
@@ -28,7 +42,11 @@ and skipped. Only inbound transfers are downloaded (the logs endpoint filtered o
 event's recipient), so a hot wallet's withdrawals never cost a call.
 
 Each wallet's history is cached in SQLite (`~/.cexflows/cache.sqlite`, or `CEXFLOWS_CACHE`) with
-the block range it covers, so a rerun only fetches new blocks.
+the block range it covers, so a rerun only fetches new blocks. Prices are cached the same way,
+with the day spans that were requested, so a token minted years ago is priced once: a free key
+serves a year of history, and the count of cached days never matched the range asked for, so every
+run used to download the whole series again. A range that reaches today still re-reads today, one
+day at a time.
 
 ## Queries
 
@@ -38,12 +56,13 @@ The server runs no SQL. Each supported query is implemented natively under a loc
 | - | - | - | - |
 | 1 | `cex_inflows` | `token_address`, `chain` (`ethereum`, `arbitrum`), `days` (default 365) | `day`, `tokens_to_cex`, `usd_to_cex`, `n_transfers`, `by_exchange` (JSON) |
 | 2 | `cohort_flows` | `token_address`, `chain`, `cliff_dates` (comma-separated), `release_days` (2), `follow_days` (30) | one row per cliff plus an `all` row: `released_tokens`, `released_usd`, `to_exchange_tokens`, `to_deposit_tokens`, `to_contract_tokens`, `to_wallet_tokens`, `to_internal_tokens`, `to_unclassified_tokens`, `retained_tokens`, `exchange_share`, `contract_share` |
-
 | 3 | `cliff_study` | `token_address`, `chain`, `cliff_dates` (at least 3), `release_tokens` (per cliff, optional), `windows` (`3,7,10,15`), `other_events` (dates to control for) | one row per window: `uplift`, `uplift_se`, `t_stat`, `placebo_n`, `placebo_median`, `placebo_min`, `placebo_max`, `placebo_share_above`, `excess_tokens`, `release_share` with `release_share_low`/`_high` (95%), `events` (JSON), `r2` |
-
 | 4 | `holder_behaviour` | `token_address`, `chain`, `top_n` (100), `as_of` (date, for backtests) | one row per modelled holder: `address`, `kind` (`price`, `time`, `trader`, `unknown`), `balance`, `share_of_supply`, `cost_basis_usd`, `zero_cost_share`, `origins` (JSON), `oldest_lot`, `n_sales`, `sold_tokens`, `median_sale_multiple`, `last_sale` |
-
 | 5 | `supply_curve` | as query 4, plus `max_multiple` (3), `step_pct` (5) and optional `target_price` (adds a step edge there) | one row per price step from today's price: `price_from`, `price_to`, `breakeven_tokens`, `takeprofit_tokens`, `step_tokens`, `cumulative_tokens`, `step_usd`, `wallets`, `time_triggered_tokens` |
+
+`days`, `top_n`, `release_days`, `follow_days` and `windows` are validated rather than coerced: a
+`0` or a negative number used to invert the date and block windows, which read back as a token
+with no inflow.
 
 `usd_to_cex` is each day's token amount at CoinGecko's daily price for that date, null where
 CoinGecko has no price.
@@ -117,13 +136,17 @@ of sales by wallets of the same size (bands by share of supply). Small wallets d
 at once and large ones sell in slices, so size matters. `supply_curve` sums the levels by
 price step. Zero-cost holders are a separate constant, since they release on a schedule, not at
 a price. The multiples are learned from the token's own past, so a token that has mostly fallen
-teaches small take-profit multiples.
+teaches small take-profit multiples. Also runnable directly, levels and curve together:
+`cexflows-holders --token 0x... --top-n 100 --as-of 2026-04-01 --curve-csv curve.csv` (or
+`python -m cexflows.holders`), with `--json` for the whole result and `--csv` for the holdings.
 
 To make a real Dune query id work against both, map it: `CEXFLOWS_QUERY_MAP=4242424=cex_inflows`.
 A query that isn't implemented gets a 404 that lists what is, never empty rows.
 
 Endpoints: `POST /api/v1/query/{id}/execute`, `GET /api/v1/execution/{id}/status`,
-`GET /api/v1/execution/{id}/results`, `GET /api/v1/query/{id}/results`. Executions live in memory.
+`GET /api/v1/execution/{id}/results`, `GET /api/v1/query/{id}/results`. Executions live in memory,
+bounded to the 200 most recent: the oldest finished ones are dropped first, so a long-running
+server doesn't keep every result it ever produced.
 
 ## Backtesting the levels
 
@@ -158,7 +181,7 @@ BIO and lose on LSK and APEX.
 | `CEXFLOWS_API_KEY` | this server's key; else `~/.cexflows-key`, generated on first run |
 | `CEXFLOWS_PORT` | port, default 8766 |
 | `CEXFLOWS_HOSTS` | extra allowed `Host` values, comma-separated (loopback is always allowed) |
-| `CEXFLOWS_QUERY_MAP` | `dune_id=query_name` pairs |
+| `CEXFLOWS_QUERY_MAP` | `dune_id=query_name` pairs; a pair without `=` or with a non-numeric id is refused at start-up |
 | `CEXFLOWS_LABELS` | a different hot-wallet CSV |
 
 A free Etherscan key covers both chains: 5 calls a second and 1,000 logs a call. A busy hot
@@ -169,7 +192,9 @@ wallet's first year of history takes a few hundred calls; the cache makes reruns
 `labels/hot_wallets.csv` lists exchange hot wallets per chain (`chain,address,exchange,source`).
 The seed set comes from [eth-labels](https://github.com/dawsbot/eth-labels) (MIT, notice in `labels/LICENSE-eth-labels`). Exchanges
 reuse hot-wallet addresses across EVM chains, so a wallet named on one chain and active with the
-token on another is included for that chain, with `source` saying where the name came from.
+token on another is included for that chain, with `source` saying where the name came from. The
+labels stay in the repository rather than inside the wheel, so a `pip install` of it needs
+`CEXFLOWS_LABELS` pointing at this file; every command says so if it can't find one.
 
 Coverage is the main limit. A missing exchange lowers the totals, so compare inflows against
 their own baseline (a cliff week against normal weeks) rather than reading them as an absolute

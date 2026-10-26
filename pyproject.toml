@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cexflows"
+version = "0.1.0"
+description = "Daily token inflows into exchange hot wallets, measured from Etherscan data and served through a local, Dune-compatible API"
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+authors = [{ name = "runa-tic" }]
+keywords = ["ethereum", "arbitrum", "etherscan", "coingecko", "exchange-inflows", "onchain", "dune"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "ruff>=0.6"]
+
+# The server, then one command per query, so the analysis does not need an HTTP client.
+[project.scripts]
+cexflows = "cexflows.server:main"
+cexflows-flows = "cexflows.flows:main"
+cexflows-cohorts = "cexflows.cohorts:main"
+cexflows-cliff = "cexflows.eventstudy:main"
+cexflows-backtest = "cexflows.backtest:main"
+cexflows-holders = "cexflows.holders:main"
+
+[tool.setuptools]
+packages = ["cexflows"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py38"
+
+[tool.ruff.lint]
+# Undefined names and pyflakes errors only. The tree assigns lambdas (E731) and uses short loop
+# names (E741) on purpose, and its lines run past 120 columns: a wider ruleset would mean
+# reformatting the author's code instead of fixing it.
+select = ["E9", "F"]

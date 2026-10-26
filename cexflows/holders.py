@@ -19,8 +19,11 @@ thousands of counterparties).
 """
 from __future__ import annotations
 
+import argparse
 import bisect
 import json
+import math
+import sys
 import urllib.request
 from collections import defaultdict, deque
 from datetime import datetime, timezone
@@ -31,6 +34,7 @@ from .cache import Cache
 from .flows import token_decimals
 from .labels import hot_wallets
 from .prices import daily_prices
+from .report import write_csv, write_json
 
 ZERO = "0x" + "0" * 40
 GECKOTERMINAL = {"ethereum": "eth", "arbitrum": "arbitrum"}
@@ -38,6 +42,17 @@ SAFE_GET_OWNERS = "0xa0e67e2b"     # getOwners(): answers only on a Safe multisi
 SERVICE_COUNTERPARTIES = 2000      # more distinct counterparties than this: a service, not a holder
 TRADER_SALES = 100                 # this many sales or more: a market maker or bot, not a holder
 HISTORY_CHUNK = 250_000            # blocks per cached chunk of a token's history
+MAX_STEPS = 10_000                 # cap on supply-curve price steps, so no input can spin forever
+
+# Column order of a holder_behaviour row and of a supply_curve row, as the Dune-shaped API, the
+# CSV export and the CLI all report them.
+HOLDER_COLUMNS = ["address", "kind", "balance", "share_of_supply", "cost_basis_usd", "zero_cost_share", "origins",
+                  "oldest_lot", "n_sales", "sold_tokens", "median_sale_multiple", "last_sale",
+                  "breakeven_price", "breakeven_tokens", "takeprofit_price", "takeprofit_tokens",
+                  "sell_fraction", "take_profit_multiple", "confidence"]
+
+CURVE_COLUMNS = ["price_from", "price_to", "breakeven_tokens", "takeprofit_tokens", "step_tokens",
+                 "cumulative_tokens", "step_usd", "wallets", "time_triggered_tokens"]
 
 
 def dex_pools(chain: str, token: str) -> Dict[str, str]:
@@ -276,8 +291,20 @@ def supply_curve(holders: List[dict], price_now: float, max_multiple: float = 3.
     `max_multiple` times it: each step's own tokens and the running total, split by level.
     `target_price` adds a step edge at exactly that price, so a buyback priced to it stops there
     instead of at the top of the step it falls in."""
+    if price_now is None or not math.isfinite(price_now) or price_now <= 0:
+        # Without a price for the as-of day there is no curve to build: it used to raise a bare
+        # TypeError from `None * max_multiple` deep in the caller.
+        raise ValueError("supply_curve needs today's price: CoinGecko has none for the as-of day")
+    if not math.isfinite(max_multiple) or max_multiple <= 1:
+        raise ValueError(f"max_multiple must be above 1, got {max_multiple}")
+    if not math.isfinite(step_pct) or not 0 < step_pct < 100:
+        # A zero or negative step never reaches the top of the curve, so the loop below would
+        # append the same edge forever (a hang, not an error).
+        raise ValueError(f"step_pct must be between 0 and 100, got {step_pct}")
+    if target_price is not None and not math.isfinite(target_price):
+        raise ValueError(f"target_price must be a finite number, got {target_price}")
     edges = [price_now]
-    while edges[-1] < price_now * max_multiple:
+    while edges[-1] < price_now * max_multiple and len(edges) <= MAX_STEPS:
         edges.append(edges[-1] * (1 + step_pct / 100))
     if target_price and price_now < target_price < edges[-1] and min(abs(e / target_price - 1) for e in edges) > 1e-9:
         bisect.insort(edges, target_price)
@@ -436,3 +463,83 @@ def holder_positions(chain: str, token: str, top_n: int = 100, as_of: Optional[s
             "price_now": price_now, "priors": {f"{b:.5f}": p for b, p in priors.items()},
             "time_triggered_tokens": sum(h["balance"] for h in holders if h["kind"] == "time"),
             "params": {"chain": chain, "token": token, "top_n": top_n, "as_of": as_of}}
+
+
+def _num(value: Optional[float], digits: int = 0) -> str:
+    return "-" if value is None else f"{value:,.{digits}f}"
+
+
+def _usd(value: Optional[float]) -> str:
+    return "-" if value is None else f"{value:,.6f}"
+
+
+def _level(price: Optional[float], tokens: Optional[float]) -> str:
+    return "-" if not price else f"{price:,.6f} x {_num(tokens or 0.0)}"
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    """Positions, sell levels and the supply curve from the command line.
+
+    Query 4 and 5 of the API, without a server and without a Dune client: the levels are the
+    point of the model, so they are reachable directly the way cohort tracking and the event
+    study already were.
+    """
+    ap = argparse.ArgumentParser(description="Holder cost basis, sell levels and the supply curve.")
+    ap.add_argument("--chain", default="ethereum")
+    ap.add_argument("--token", required=True)
+    ap.add_argument("--top-n", type=int, default=100, help="holders to model, largest first")
+    ap.add_argument("--as-of", help="YYYY-MM-DD: rebuild the book as of the start of that day")
+    ap.add_argument("--max-multiple", type=float, default=3.0, help="top of the curve, as a multiple of today")
+    ap.add_argument("--step-pct", type=float, default=5.0, help="price step, in percent")
+    ap.add_argument("--target-price", type=float, help="add a step edge at exactly this price")
+    ap.add_argument("--no-curve", action="store_true", help="positions and levels only")
+    ap.add_argument("--json", metavar="PATH", help="write the full result as JSON ('-' for stdout)")
+    ap.add_argument("--csv", metavar="PATH", help="write the holders table as CSV ('-' for stdout)")
+    ap.add_argument("--curve-csv", metavar="PATH", help="write the supply curve as CSV")
+    ap.add_argument("--quiet", action="store_true", help="no progress on stderr")
+    a = ap.parse_args(argv)
+    progress = (lambda m: None) if a.quiet else (lambda m: print(m, file=sys.stderr, flush=True))
+    try:
+        res = holder_positions(a.chain, a.token, top_n=a.top_n, as_of=a.as_of, progress=progress)
+        curve = [] if a.no_curve else supply_curve(res["holders"], res["price_now"], a.max_multiple,
+                                                   a.step_pct, a.target_price)
+    except ValueError as e:
+        raise SystemExit(f"cexflows holders: {e}")
+    if a.json:
+        write_json({**res, "curve": curve,
+                    "curve_params": {"max_multiple": a.max_multiple, "step_pct": a.step_pct,
+                                     "target_price": a.target_price}}, a.json)
+    if a.csv:
+        write_csv(res["holders"], a.csv, HOLDER_COLUMNS)
+    if a.curve_csv:
+        write_csv(curve, a.curve_csv, CURVE_COLUMNS)
+    if "-" in (a.json, a.csv, a.curve_csv):
+        return                                   # stdout is carrying the data, not a table
+
+    set_aside = sum(e["share_of_supply"] for e in res["excluded"])
+    print(f"price {_usd(res['price_now'])} USD, supply {_num(res['supply'])} tokens")
+    print(f"{len(res['holders'])} holders modelled, {len(res['excluded'])} large wallets set aside "
+          f"({set_aside:.1%} of supply), {res['lot_mismatches']} with lots not matching their balance")
+    print()
+    print(f"{'address':<42}  {'kind':<7} {'balance':>18}  {'share':>7}  {'cost basis':>12}  {'sales':>5}  "
+          f"{'break-even':>30}  {'take-profit':>30}  {'confidence':>10}")
+    for h in res["holders"]:
+        print(f"{h['address']:<42}  {h['kind']:<7} {_num(h['balance']):>18}  {h['share_of_supply']:>7.3%}  "
+              f"{_usd(h['cost_basis_usd']):>12}  {h['n_sales']:>5}  "
+              f"{_level(h['breakeven_price'], h['breakeven_tokens']):>30}  "
+              f"{_level(h['takeprofit_price'], h['takeprofit_tokens']):>30}  {h['confidence'] or '-':>10}")
+    if a.no_curve:
+        return
+    print()
+    print(f"supply curve: {_usd(res['price_now'])} to {_usd((res['price_now'] or 0) * a.max_multiple)} USD "
+          f"in {a.step_pct:g}% steps; {_num(res['time_triggered_tokens'])} tokens release on a schedule, not at a price")
+    print(f"{'price from':>12}  {'price to':>12}  {'break-even':>14}  {'take-profit':>14}  {'step':>14}  "
+          f"{'cumulative':>14}  {'step USD':>16}  {'wallets':>7}")
+    for r in curve:
+        print(f"{_usd(r['price_from']):>12}  {_usd(r['price_to']):>12}  {_num(r['breakeven_tokens']):>14}  "
+              f"{_num(r['takeprofit_tokens']):>14}  {_num(r['step_tokens']):>14}  {_num(r['cumulative_tokens']):>14}  "
+              f"{_num(r['step_usd'], 2):>16}  {r['wallets']:>7}")
+
+
+if __name__ == "__main__":
+    main()

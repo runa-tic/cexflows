@@ -37,7 +37,7 @@ import json
 import math
 import sys
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from . import etherscan
@@ -49,6 +49,11 @@ from .prices import daily_prices
 ZERO = "0x" + "0" * 40
 DAY = 86400
 
+# Column order of a cohort_flows row, as the Dune-shaped API and the CLI both report it.
+COHORT_COLUMNS = ["cliff_date", "released_tokens", "released_usd", "to_exchange_tokens", "to_deposit_tokens",
+                  "to_contract_tokens", "to_wallet_tokens", "to_internal_tokens", "to_unclassified_tokens",
+                  "retained_tokens", "exchange_share", "contract_share"]
+
 
 def _day_ts(day: str) -> int:
     return int(datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
@@ -56,8 +61,13 @@ def _day_ts(day: str) -> int:
 
 def window_transfers(chain: str, token: str, ts_from: int, ts_to: int, cache: Cache) -> List[dict]:
     """Every transfer of the token in [ts_from, ts_to), cached by block range."""
+    if ts_from >= ts_to:
+        raise ValueError(f"empty window: {ts_from} >= {ts_to} (release_days and follow_days must be positive)")
     from_block = etherscan.block_at(chain, ts_from, "after")
     to_block = etherscan.block_at(chain, ts_to - 1, "before")
+    if from_block > to_block:
+        raise ValueError(f"window {ts_from}..{ts_to} maps to an empty block range "
+                         f"({from_block} > {to_block}); check release_days")
     if not any(a <= from_block and b >= to_block for a, b in cache.token_log_ranges(chain, token)):
         cache.store_token_logs(chain, token, etherscan.transfers(chain, token, from_block, to_block),
                                from_block, to_block)

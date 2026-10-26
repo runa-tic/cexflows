@@ -14,12 +14,41 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .cache import Cache
 
 PLATFORMS = {"ethereum": "ethereum", "arbitrum": "arbitrum-one"}
 _CFG = os.path.join(os.path.expanduser("~"), ".config", "cexflows")
+
+
+def _day(ts: float) -> str:
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")
+
+
+def _day_ts(day: str) -> int:
+    return int(datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
+
+
+def _shift_day(day: str, step: int) -> str:
+    return (datetime.strptime(day, "%Y-%m-%d") + timedelta(days=step)).strftime("%Y-%m-%d")
+
+
+def missing_days(ranges: List[Tuple[str, str]], day_from: str, day_to: str) -> List[Tuple[str, str]]:
+    """The parts of [day_from, day_to] no stored span covers, as day spans."""
+    out: List[Tuple[str, str]] = []
+    cur = day_from
+    for a, b in sorted(ranges):
+        if b < cur or a > day_to:
+            continue
+        if a > cur:
+            out.append((cur, _shift_day(a, -1)))
+        cur = max(cur, _shift_day(b, 1))
+        if cur > day_to:
+            break
+    if cur <= day_to:
+        out.append((cur, day_to))
+    return out
 
 
 def _read(path: str) -> str:
@@ -59,32 +88,43 @@ def daily_prices(chain: str, token: str, start_ts: int, end_ts: int,
                  cache: Optional[Cache] = None) -> Dict[str, float]:
     """UTC day -> USD price for every day in [start_ts, end_ts] that CoinGecko has.
 
-    Each day's value is CoinGecko's daily point for that date (its 00:00 UTC price). Days already
-    cached are not fetched again, except today, whose price is still moving.
+    Each day's value is CoinGecko's daily point for that date (its 00:00 UTC price). Only the day
+    spans that were never requested are fetched: a token minted years ago used to be re-priced on
+    every run, because a free key serves a year of history and the day count never matched the
+    range asked for. A range that reaches today still re-reads today, whose price is moving, and
+    only for that day.
     """
     chain, token = chain.lower(), token.lower()
     platform = PLATFORMS.get(chain)
     if not platform:
         raise ValueError(f"no CoinGecko platform for chain {chain!r}")
+    if start_ts > end_ts:
+        raise ValueError(f"start_ts {start_ts} is after end_ts {end_ts}")
     cache = cache or Cache()
-    day = lambda ts: datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")
-    have = cache.prices(chain, token, day(start_ts), day(end_ts))
-    today = day(time.time())
-    wanted_days = int((end_ts - start_ts) // 86400) + 1
-    missing = len([d for d in have if d != today]) < wanted_days - (1 if day(end_ts) == today else 0)
-    if missing:
+    day_from, day_to = _day(start_ts), _day(end_ts)
+    today = _day(time.time())
+    spans: List[Tuple[str, str]] = []
+    for lo, hi in missing_days(cache.price_ranges(chain, token), day_from, day_to):
+        if day_to < today or hi < today:
+            spans.append((lo, hi))
+        elif lo < today:
+            # Only the part before today: today, whose price is still moving, is re-read below.
+            spans.append((lo, _shift_day(today, -1)))
+    if day_to >= today:
+        spans.append((today, day_to))
+    for lo, hi in spans:
         base, headers = endpoint()
-        q = urllib.parse.urlencode({"vs_currency": "usd", "from": int(start_ts) - 86400, "to": int(end_ts) + 86400})
+        q = urllib.parse.urlencode({"vs_currency": "usd", "from": _day_ts(lo) - 86400, "to": _day_ts(hi) + 86400})
         data = _get(f"{base}/coins/{platform}/contract/{token}/market_chart/range?{q}", headers)
         points: Dict[str, float] = {}
         for ms, price in data.get("prices", []):
-            d = day(ms / 1000)
+            d = _day(ms / 1000)
             # Keep the earliest point of each day: CoinGecko's daily series stamps 00:00 UTC.
             if d not in points:
                 points[d] = float(price)
         cache.store_prices(chain, token, points)
-        have = cache.prices(chain, token, day(start_ts), day(end_ts))
-    return have
+        cache.store_price_range(chain, token, lo, hi)
+    return cache.prices(chain, token, day_from, day_to)
 
 
 def daily_market(chain: str, token: str, start_ts: int, end_ts: int) -> Dict[str, Dict[str, float]]:

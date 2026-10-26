@@ -28,6 +28,11 @@ from . import flows
 from .cache import Cache
 from .prices import daily_market
 
+# Column order of a cliff_study row, as the Dune-shaped API reports it.
+STUDY_COLUMNS = ["window_days", "uplift", "uplift_se", "t_stat", "placebo_n", "placebo_median", "placebo_min",
+                 "placebo_max", "placebo_share_above", "excess_tokens", "release_share", "release_share_low",
+                 "release_share_high", "events", "r2"]
+
 
 def ols(X: List[List[float]], y: List[float]) -> Tuple[List[float], List[float], float]:
     """Least squares by the normal equations: coefficients, standard errors, R^2."""

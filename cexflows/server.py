@@ -29,15 +29,35 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Dict, List, Optional
 
-from . import flows
+from . import cohorts, eventstudy, flows, holders
+from .cohorts import COHORT_COLUMNS
+from .eventstudy import STUDY_COLUMNS
+from .holders import CURVE_COLUMNS, HOLDER_COLUMNS
 
-# Each query: name -> (local id, handler(params) -> rows, column order).
+# Executions kept in memory. A long-lived server would otherwise hold every result it ever
+# produced; finished ones are dropped oldest first once there are more than this.
+MAX_EXECUTIONS = 200
+
+
+def _int_param(params: dict, name: str, default: int, minimum: Optional[int] = None) -> int:
+    """An integer query parameter. Dune clients pass JSON, so 365 and "365" both arrive here.
+
+    `0` and negative values are rejected rather than coerced: they silently inverted the date and
+    block windows downstream (an empty result that reads as "no inflows").
+    """
+    raw = params.get(name)
+    value = default if raw in (None, "") else int(float(raw))
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{name} must be at least {minimum}, got {value}")
+    return value
+
+
 def _cex_inflows(params: dict) -> List[dict]:
     token = str(params.get("token_address") or "").strip()
     chain = str(params.get("chain") or "").strip()
     if not re.fullmatch(r"0x[0-9a-fA-F]{40}", token) or not chain:
         raise ValueError("cex_inflows needs token_address (0x + 40 hex) and chain")
-    days = int(float(params.get("days") or 365))
+    days = _int_param(params, "days", 365, minimum=1)
     rows = flows.daily_inflows(chain, token, days=days, progress=lambda m: print(m, file=sys.stderr))
     return [{"day": r["day"], "tokens_to_cex": r["tokens_to_cex"], "usd_to_cex": r.get("usd_to_cex"),
              "n_transfers": r["n_transfers"], "by_exchange": json.dumps(r["by_exchange"], sort_keys=True)}
@@ -45,8 +65,6 @@ def _cex_inflows(params: dict) -> List[dict]:
 
 
 def _cohort_flows(params: dict) -> List[dict]:
-    from . import cohorts
-
     token = str(params.get("token_address") or "").strip()
     chain = str(params.get("chain") or "").strip()
     raw = params.get("cliff_dates") or ""
@@ -54,15 +72,13 @@ def _cohort_flows(params: dict) -> List[dict]:
     if not re.fullmatch(r"0x[0-9a-fA-F]{40}", token) or not chain or len(dates) < 2:
         raise ValueError("cohort_flows needs token_address, chain and at least two cliff_dates (YYYY-MM-DD, comma-separated)")
     res = cohorts.cohort_flows(chain, token, dates,
-                               release_days=int(float(params.get("release_days") or 2)),
-                               follow_days=int(float(params.get("follow_days") or 30)),
+                               release_days=_int_param(params, "release_days", 2, minimum=1),
+                               follow_days=_int_param(params, "follow_days", 30, minimum=1),
                                progress=lambda m: print(m, file=sys.stderr))
     return res["rows"]
 
 
 def _cliff_study(params: dict) -> List[dict]:
-    from . import eventstudy
-
     token = str(params.get("token_address") or "").strip()
     chain = str(params.get("chain") or "").strip()
     split = lambda v: [x.strip() for x in (v if isinstance(v, list) else str(v or "").split(",")) if str(x).strip()]
@@ -70,61 +86,45 @@ def _cliff_study(params: dict) -> List[dict]:
     if not re.fullmatch(r"0x[0-9a-fA-F]{40}", token) or not chain or len(dates) < 3:
         raise ValueError("cliff_study needs token_address, chain and at least three cliff_dates (YYYY-MM-DD, comma-separated)")
     release = params.get("release_tokens")
+    windows = [int(float(w)) for w in split(params.get("windows"))] or [3, 7, 10, 15]
+    if min(windows) < 1:
+        raise ValueError(f"windows must be positive day counts, got {windows}")
     res = eventstudy.cliff_study(chain, token, dates, float(release) if release not in (None, "") else None,
-                                 [int(float(w)) for w in split(params.get("windows")) or [3, 7, 10, 15]],
-                                 split(params.get("other_events")),
+                                 windows, split(params.get("other_events")),
                                  progress=lambda m: print(m, file=sys.stderr))
     return [{**{k: v for k, v in r.items() if k != "events"}, "events": json.dumps(r["events"], sort_keys=True)}
             for r in res["rows"]]
 
 
 def _holder_behaviour(params: dict) -> List[dict]:
-    from . import holders
-
     token = str(params.get("token_address") or "").strip()
     chain = str(params.get("chain") or "").strip()
     if not re.fullmatch(r"0x[0-9a-fA-F]{40}", token) or not chain:
         raise ValueError("holder_behaviour needs token_address (0x + 40 hex) and chain")
     as_of = str(params.get("as_of") or "").strip() or None
-    res = holders.holder_positions(chain, token, top_n=int(float(params.get("top_n") or 100)), as_of=as_of,
+    res = holders.holder_positions(chain, token, top_n=_int_param(params, "top_n", 100, minimum=1), as_of=as_of,
                                    progress=lambda m: print(m, file=sys.stderr))
     return res["holders"]
 
 
 def _supply_curve(params: dict) -> List[dict]:
-    from . import holders
-
     token = str(params.get("token_address") or "").strip()
     chain = str(params.get("chain") or "").strip()
     if not re.fullmatch(r"0x[0-9a-fA-F]{40}", token) or not chain:
         raise ValueError("supply_curve needs token_address (0x + 40 hex) and chain")
     as_of = str(params.get("as_of") or "").strip() or None
-    res = holders.holder_positions(chain, token, top_n=int(float(params.get("top_n") or 100)), as_of=as_of,
+    res = holders.holder_positions(chain, token, top_n=_int_param(params, "top_n", 100, minimum=1), as_of=as_of,
                                    progress=lambda m: print(m, file=sys.stderr))
+    target = params.get("target_price")
     rows = holders.supply_curve(res["holders"], res["price_now"],
                                 max_multiple=float(params.get("max_multiple") or 3),
                                 step_pct=float(params.get("step_pct") or 5),
-                                target_price=float(params.get("target_price") or 0) or None)
+                                target_price=float(target) if target not in (None, "") else None)
     # Zero-cost holders release on a schedule, not at a price: one constant column, not a level.
     return [{**r, "time_triggered_tokens": res["time_triggered_tokens"]} for r in rows]
 
 
-CURVE_COLUMNS = ["price_from", "price_to", "breakeven_tokens", "takeprofit_tokens", "step_tokens",
-                 "cumulative_tokens", "step_usd", "wallets", "time_triggered_tokens"]
-
-HOLDER_COLUMNS = ["address", "kind", "balance", "share_of_supply", "cost_basis_usd", "zero_cost_share", "origins",
-                  "oldest_lot", "n_sales", "sold_tokens", "median_sale_multiple", "last_sale",
-                  "breakeven_price", "breakeven_tokens", "takeprofit_price", "takeprofit_tokens",
-                  "sell_fraction", "take_profit_multiple", "confidence"]
-
-STUDY_COLUMNS = ["window_days", "uplift", "uplift_se", "t_stat", "placebo_n", "placebo_median", "placebo_min",
-                 "placebo_max", "placebo_share_above", "excess_tokens", "release_share", "release_share_low",
-                 "release_share_high", "events", "r2"]
-
-COHORT_COLUMNS = ["cliff_date", "released_tokens", "released_usd", "to_exchange_tokens", "to_deposit_tokens",
-                  "to_contract_tokens", "to_wallet_tokens", "to_internal_tokens", "to_unclassified_tokens",
-                  "retained_tokens", "exchange_share", "contract_share"]
-
+# Each query: name -> (local id, handler(params) -> rows, column order).
 QUERIES: Dict[str, tuple] = {
     "cex_inflows": (1, _cex_inflows, ["day", "tokens_to_cex", "usd_to_cex", "n_transfers", "by_exchange"]),
     "cohort_flows": (2, _cohort_flows, COHORT_COLUMNS),
@@ -137,7 +137,12 @@ QUERIES: Dict[str, tuple] = {
 def query_map() -> Dict[int, str]:
     out = {local_id: name for name, (local_id, _, _) in QUERIES.items()}
     for pair in filter(None, (p.strip() for p in os.environ.get("CEXFLOWS_QUERY_MAP", "").split(","))):
-        qid, _, name = pair.partition("=")
+        qid, sep, name = pair.partition("=")
+        if not sep or not name.strip():
+            raise SystemExit(f"CEXFLOWS_QUERY_MAP: expected dune_id=query_name, got {pair!r}")
+        if not qid.strip().isdigit():
+            # int("abc") used to escape as a ValueError traceback from inside the server start-up.
+            raise SystemExit(f"CEXFLOWS_QUERY_MAP: {qid.strip()!r} is not a numeric Dune query id (in {pair!r})")
         if name.strip() not in QUERIES:
             raise SystemExit(f"CEXFLOWS_QUERY_MAP: unknown query {name.strip()!r} (supported: {', '.join(QUERIES)})")
         out[int(qid)] = name.strip()
@@ -164,10 +169,12 @@ def _now() -> str:
 
 
 class Executions:
-    def __init__(self, runner: Optional[Callable[[str, dict], List[dict]]] = None):
+    def __init__(self, runner: Optional[Callable[[str, dict], List[dict]]] = None,
+                 max_items: int = MAX_EXECUTIONS):
         self.lock = threading.Lock()
         self.items: Dict[str, dict] = {}
         self.latest: Dict[int, str] = {}
+        self.max_items = max_items
         self.runner = runner or (lambda name, params: QUERIES[name][1](params))
 
     def start(self, query_id: int, name: str, params: dict) -> dict:
@@ -178,6 +185,17 @@ class Executions:
             self.items[eid] = item
         threading.Thread(target=self._run, args=(eid,), daemon=True).start()
         return item
+
+    def _prune(self) -> None:
+        """Drop the oldest finished executions, keeping a bounded amount of memory."""
+        with self.lock:
+            excess = len(self.items) - self.max_items
+            if excess <= 0:
+                return
+            done = sorted((v.get("execution_ended_at") or "", k) for k, v in self.items.items()
+                          if v["state"] in ("QUERY_STATE_COMPLETED", "QUERY_STATE_FAILED"))
+            for _, eid in done[:excess]:
+                self.items.pop(eid, None)
 
     def _run(self, eid: str) -> None:
         item = self.items[eid]
@@ -192,6 +210,7 @@ class Executions:
             traceback.print_exc()
             item.update(state="QUERY_STATE_FAILED", error={"type": type(e).__name__, "message": str(e)})
         item["execution_ended_at"] = _now()
+        self._prune()
 
     def status(self, item: dict) -> dict:
         out = {k: item[k] for k in ("execution_id", "query_id", "state", "submitted_at") if k in item}
@@ -276,10 +295,10 @@ def make_handler(key: str, hosts: set, executions: Executions, qmap: Dict[int, s
             if m:
                 if self._query(m.group(1)) is None:
                     return
-                eid = executions.latest.get(int(m.group(1)))
-                if eid is None:
+                item = executions.items.get(executions.latest.get(int(m.group(1))) or "")
+                if item is None:
                     return self._send(404, {"error": "not found: No execution found for the latest version of the given query"})
-                return self._send(200, executions.results(executions.items[eid]))
+                return self._send(200, executions.results(item))
             self._send(404, {"error": "not found"})
 
     return Handler
