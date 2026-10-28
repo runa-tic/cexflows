@@ -182,6 +182,13 @@ prior trading) separated the two, so the market-maker layer should be read as "t
 real chance of a dump". Holders are steadier; the misses that remain are a few rallies where
 they sold heavily early (DEXE and LSK by 1.5x).
 
+That chance gets its own curve. `--save` also fits a dump case, the market-maker curve over only
+the rallies where they had sold 10% or more of their balance by 1.25x (the two populations sit at
+0-5% and 19-84%, so the cut is in the gap), never below the typical curve, and saves it as
+`trader_dump` with the list of rallies it came from. Query 5 adds `trader_dump_tokens` per step,
+and ph-model quotes the hold cost twice: typical, and if market makers dump. With 5 dump rallies
+it is a scenario, not a forecast; nothing yet says which case a token is in.
+
 Making the curves required two fixes found during the check: shares are combined per rally,
 since pooling token counts let the largest-supply token dominate, and a wallet holding 5% or more
 of supply at zero cost that has never sold is set aside as a treasury (APEX had two, 50% and

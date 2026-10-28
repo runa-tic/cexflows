@@ -112,7 +112,7 @@ def _supply_curve(params: dict) -> List[dict]:
 
 CURVE_COLUMNS = ["price_from", "price_to", "breakeven_tokens", "takeprofit_tokens", "step_tokens",
                  "cumulative_tokens", "step_usd", "wallets", "time_triggered_tokens", "curve_tokens",
-                 "trader_tokens"]
+                 "trader_tokens", "trader_dump_tokens"]
 
 HOLDER_COLUMNS = ["address", "kind", "balance", "share_of_supply", "cost_basis_usd", "zero_cost_share", "origins",
                   "oldest_lot", "n_sales", "sold_tokens", "median_sale_multiple", "last_sale",

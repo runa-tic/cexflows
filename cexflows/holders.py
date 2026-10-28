@@ -281,7 +281,8 @@ def supply_curve(holders: List[dict], price_now: float, max_multiple: float = 3.
     `target_price` adds a step edge at exactly that price, so a buyback priced to it stops there
     instead of at the top of the step it falls in. With `curves` (sellcurve.load()), each step
     also has `curve_tokens` and `trader_tokens`: the net selling the fitted sell-through curves
-    expect from the holders and the market makers as the price runs through it. The backtest
+    expect from the holders and the market makers as the price runs through it, and
+    `trader_dump_tokens`, the market makers in the dump case (None when the curves have none). The backtest
     found the levels under-predict rally selling 2-32x; the curves came within 1.2-2.7x on three
     of four held-out rallies and over-predicted the fourth 4x."""
     edges = [price_now]
@@ -302,7 +303,8 @@ def supply_curve(holders: List[dict], price_now: float, max_multiple: float = 3.
                      "takeprofit_tokens": sum(t for t, _ in tp), "step_tokens": step, "cumulative_tokens": cum,
                      "step_usd": step * (lo + hi) / 2, "wallets": len({h["address"] for _, h in be + tp}),
                      "curve_tokens": layers["holders"] if layers else None,
-                     "trader_tokens": layers["traders"] if layers else None})
+                     "trader_tokens": layers["traders"] if layers else None,
+                     "trader_dump_tokens": layers["traders_dump"] if layers else None})
     return rows
 
 

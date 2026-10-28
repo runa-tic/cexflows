@@ -431,3 +431,29 @@ def test_fit_median_is_not_dragged_by_one_rally():
     rs = [rally(0.0), rally(2.0), rally(90.0)]
     assert abs(sellcurve.fit(rs, [1.1])["trader"][0] - 0.92 / 3) < 1e-9
     assert sellcurve.fit(rs, [1.1], stat="median")["trader"][0] == 0.02
+
+
+def test_dump_case_fits_market_makers_on_the_rallies_where_they_dumped():
+    from cexflows import sellcurve
+    from cexflows.holders import supply_curve
+
+    def rally(name, sold_by_125):
+        hs = [{"group": "trader", "balance": 100.0, "events": [[1.25, sold_by_125]]} for _ in range(3)]
+        return {"token": name, "name": name, "max_multiple": 2.0, "holders": hs}
+    rs = [rally("a", 0.0), rally("b", 2.0), rally("c", 4.0), rally("d", 40.0), rally("e", 80.0)]
+    grid = [1.25, 2.0]
+    curves = sellcurve.fit(rs, grid, stat="median")
+    dump = sellcurve.dump_case(rs, curves, grid)
+    assert curves["trader"] == [0.04, 0.04]                      # the typical rally sits
+    assert dump["rallies"] == ["d", "e"] and dump["of"] == 5
+    assert all(abs(v - 0.6) < 1e-9 for v in dump["curve"])      # median of the two dumps
+    assert sellcurve.dump_case(rs[:3], sellcurve.fit(rs[:3], grid), grid) is None
+
+    fitted = {"grid": grid, "curves": dict({g: [0.0, 0.0] for g in sellcurve.GROUPS + ["all"]},
+                                           trader=curves["trader"], trader_dump=dump["curve"])}
+    mm = [{"address": "m", "kind": "trader", "balance": 10, "cost_basis_usd": 1.0, "breakeven_price": None,
+           "breakeven_tokens": 0, "takeprofit_price": None, "takeprofit_tokens": 0}]
+    rows = supply_curve(mm, 1.0, max_multiple=1.25, step_pct=25, curves=fitted)
+    assert abs(rows[0]["trader_tokens"] - 0.4) < 1e-9 and abs(rows[0]["trader_dump_tokens"] - 6) < 1e-9
+    del fitted["curves"]["trader_dump"]
+    assert supply_curve(mm, 1.0, max_multiple=1.25, step_pct=25, curves=fitted)[0]["trader_dump_tokens"] is None

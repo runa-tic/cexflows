@@ -18,6 +18,12 @@ and the shipped curves take the median (market makers either sit or dump; a mean
 A group with fewer than MIN_HOLDERS holders in a rally at some k leaves that rally out of it; with
 no rally left it uses all groups.
 
+The median is the typical rally, and for market makers it hides the other kind. In 7 of 12 rallies
+they sold 0-5% by 1.25x; in the other 5 they sold 19-84%, and nothing at the trough told the two
+apart. So --save also fits a dump case: the market-maker curve over only the rallies where they had
+sold at least DUMP_SHARE of their balance by DUMP_K, saved as curves["trader_dump"]. Quotes show it
+as a second hold cost beside the typical one, with the share of rallies it came from.
+
 Records come from backtest.rally_records. python -m cexflows.sellcurve records/*.json runs the
 leave-one-rally-out check: fit on the others, predict the held-out rally's top holders.
 """
@@ -33,6 +39,9 @@ from typing import Dict, List, Optional
 GRID = [1.1, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.5, 8.0, 10.0, 12.0]
 GROUPS = ["underwater", "in_profit", "zero_cost", "unknown", "trader"]
 MIN_HOLDERS = 3
+# A dump rally: market makers had sold this share of their balance, net, by this multiple. The
+# 13-rally check put the two populations at 0-5% and 19-84% by 1.25x, so 10% sits in the gap.
+DUMP_K, DUMP_SHARE = 1.25, 0.10
 # Curves fitted on the backtest rallies, shipped with the package; refit with `--save`.
 CURVES_PATH = os.path.join(os.path.dirname(__file__), "sell_curves.json")
 
@@ -58,14 +67,17 @@ def load(path: str = CURVES_PATH) -> Optional[dict]:
 
 def step_tokens(holders: List[dict], fitted: dict, p0: float, lo: float, hi: float) -> Dict[str, float]:
     """Net tokens holders would sell while the price runs from lo to hi, split into the
-    "holders" layer and the "traders" (market makers) layer."""
+    "holders" layer and the "traders" (market makers) layer, plus "traders_dump", the market
+    makers on the dump-case curve (None when the fitted curves have none)."""
     grid, curves = fitted["grid"], fitted["curves"]
-    out = {"holders": 0.0, "traders": 0.0}
+    dump = curves.get("trader_dump")
+    out = {"holders": 0.0, "traders": 0.0, "traders_dump": 0.0 if dump else None}
+    step = lambda c: share_at(c, hi / p0, grid) - share_at(c, lo / p0, grid)
     for h in holders:
         g = position_group(h, p0)
-        c = curves[g]
-        d = share_at(c, hi / p0, grid) - share_at(c, lo / p0, grid)
-        out["traders" if g == "trader" else "holders"] += h["balance"] * d
+        out["traders" if g == "trader" else "holders"] += h["balance"] * step(curves[g])
+        if g == "trader" and dump:
+            out["traders_dump"] += h["balance"] * step(dump)
     return out
 
 
@@ -88,13 +100,7 @@ def fit(rallies: List[dict], grid: List[float] = GRID, stat: str = "mean") -> Di
     for g in GROUPS + ["all"]:
         row: List[Optional[float]] = []
         for k in grid:
-            shares = []
-            for r in rallies:
-                hs = [h for h in r["holders"] if (g == "all" or h["group"] == g) and h["balance"] > 0]
-                if r["max_multiple"] < k or len(hs) < (1 if g == "all" else MIN_HOLDERS):
-                    continue
-                bal = sum(h["balance"] for h in hs)
-                shares.append(sum(sold_by(h["events"], h["balance"], k) for h in hs) / bal)
+            shares = [s for s in (group_share(r, g, k) for r in rallies) if s is not None]
             row.append(_combine(shares, stat) if shares else None)
         curves[g] = row
     for g in GROUPS:                       # thin groups borrow the pooled curve
@@ -105,6 +111,29 @@ def fit(rallies: List[dict], grid: List[float] = GRID, stat: str = "mean") -> Di
             last = max(last, v) if v is not None else last
             row[i] = last
     return curves
+
+
+def group_share(r: dict, g: str, k: float) -> Optional[float]:
+    """Net share of group g's starting balance sold by k in rally r; None when the rally didn't
+    reach k or the group has too few holders in it ("all" takes every holder)."""
+    hs = [h for h in r["holders"] if (g == "all" or h["group"] == g) and h["balance"] > 0]
+    if r["max_multiple"] < k or len(hs) < (1 if g == "all" else MIN_HOLDERS):
+        return None
+    return sum(sold_by(h["events"], h["balance"], k) for h in hs) / sum(h["balance"] for h in hs)
+
+
+def dump_case(rallies: List[dict], curves: Dict[str, List[float]], grid: List[float] = GRID,
+              stat: str = "median") -> Optional[dict]:
+    """The market-maker curve over the dump rallies only, never below the typical curve, and which
+    rallies those were out of the ones with a market-maker reading at DUMP_K. None with no dump
+    rally."""
+    read = [r for r in rallies if group_share(r, "trader", DUMP_K) is not None]
+    dumped = [r for r in read if group_share(r, "trader", DUMP_K) >= DUMP_SHARE]
+    if not dumped:
+        return None
+    curve = [max(d, t) for d, t in zip(fit(dumped, grid, stat)["trader"], curves["trader"])]
+    return {"curve": curve, "k": DUMP_K, "share": DUMP_SHARE,
+            "rallies": [r.get("name") or r["token"] for r in dumped], "of": len(read)}
 
 
 def _combine(xs: List[float], stat: str) -> float:
@@ -184,11 +213,14 @@ def main(argv: Optional[List[str]] = None) -> None:
     curves = fit(rallies, stat=stat)
     loo = leave_one_out(rallies, stat=stat)
     names = {r["token"]: r.get("name") or r["token"] for r in rallies}
+    dump = dump_case(rallies, curves, stat=stat)
     if save:
         peaks = [r for r in loo if r["layer"] == "holders" and r["k"] == round(
             next(x["max_multiple"] for x in rallies if x["token"] == r["token"]), 2)]
         with open(CURVES_PATH, "w", encoding="utf-8") as f:
-            json.dump({"grid": GRID, "stat": stat, "curves": curves,
+            saved = dict(curves, trader_dump=dump["curve"]) if dump else curves
+            json.dump({"grid": GRID, "stat": stat, "curves": saved,
+                       "dump_case": {k: v for k, v in dump.items() if k != "curve"} if dump else None,
                        "rallies": [{"name": r.get("name") or r["token"], "start": r["start"], "peak": r["peak"],
                                     "max_multiple": round(r["max_multiple"], 2)} for r in rallies],
                        "leave_one_out_at_peak": {names[r["token"]]: round(r["realized_over_predicted"], 2) for r in peaks
@@ -198,6 +230,14 @@ def main(argv: Optional[List[str]] = None) -> None:
     print("  " + "".join(f"{k:>7g}x" for k in GRID))
     for g in GROUPS + ["all"]:
         print(f"  {g:<11}" + "".join(f"{v:>8.0%}" for v in curves[g]))
+    print(f"\nmarket makers' net share sold by {DUMP_K:g}x per rally (dump case at {DUMP_SHARE:.0%} or more):")
+    for r in rallies:
+        v = group_share(r, "trader", DUMP_K)
+        if v is not None:
+            print(f"  {names[r['token']]:<10} {v:>6.1%}" + ("  dump" if v >= DUMP_SHARE else ""))
+    if dump:
+        print("  dump curve " + "".join(f"{v:>8.0%}" for v in dump["curve"]) +
+              f"  ({len(dump['rallies'])} of {dump['of']} rallies)")
     print("\nleave one rally out, summary (median error as a factor, share of rallies within 2x):")
     for x in summarize(loo):
         print(f"  {x['layer']:<8} {x['lift']:<6} {x['rallies']:>3} rallies  median off by {x['median_factor']:.2f}x  "
